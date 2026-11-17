@@ -7,6 +7,22 @@ suppressPackageStartupMessages({
   library(data.table)
 })
 
+# Generic primary-model fitting, also reusable on independently prepared
+# sensitivity cohort RDS files supplied through --db_path.
+#
+# Examples of cohort restrictions: SCr-only versus SCr/urine-output AKI,
+# invasive mechanical ventilation (including strict MV definitions),
+# absence of CKD, measured pre-ICU baseline SCr, RRT versus no RRT,
+# and age-defined subgroups when analysed.
+#
+# Fit each subgroup independently, using the same JLCM specification.
+# Example:
+# Rscript 01_JLCM_fitting.R --db_path=/secure/AKI_SCr_MV.rds \
+#   --dataset=AUMC_MV --out_dir=/secure/models/MV --g_min=2 --g_max=5
+#
+# NOTE: The separate time-dependent RRT sensitivity analysis extends
+# the longitudinal submodel and is not implemented in this generic script.
+
 cat("==== Jointlcmm (quadratic) + winsor + competing risks + horizon variable ====\n")
 
 # ----------------------------
@@ -29,7 +45,6 @@ parse_args <- function() {
     
     horizon_d  = 14L,         # 7 or 14
     time_var   = "time_s",    # "time_s" (0-1) or "time_day" (days)
-    with_rrt   = 0L,          # 0 = Surv~1, 1 = Surv~rrt_td
     
     seed       = 2025L,
     winsor_p   = 0.99,
@@ -56,7 +71,6 @@ parse_args <- function() {
       
       if (key == "horizon_d")  res$horizon_d <- as.integer(val)
       if (key == "time_var")   res$time_var <- as.character(val)
-      if (key == "with_rrt")   res$with_rrt <- as.integer(val)
       
       if (key == "seed")       res$seed <- as.integer(val)
       if (key == "winsor_p")   res$winsor_p <- as.numeric(val)
@@ -83,7 +97,6 @@ cat("[CFG] maxiter     :", cfg$maxiter, "\n")
 cat("[CFG] g_min..g_max:", cfg$g_min, "->", cfg$g_max, "\n")
 cat("[CFG] horizon_d   :", cfg$horizon_d, "days\n")
 cat("[CFG] time_var    :", cfg$time_var, "\n")
-cat("[CFG] with_rrt    :", cfg$with_rrt, "(0=Surv~1, 1=Surv~rrt_td)\n")
 cat("[CFG] winsor_p    :", cfg$winsor_p, "\n")
 cat("[CFG] seed        :", cfg$seed, "\n")
 
@@ -109,7 +122,6 @@ dt <- as.data.table(readRDS(cfg$db_path))
 # Validate columns
 # ----------------------------
 req <- c("id", "scr_mgdl", "tte_pos", "event2", "time_day", "time_s")
-if (cfg$with_rrt == 1L) req <- c(req, "rrt_td")
 
 miss <- setdiff(req, names(dt))
 if (length(miss) > 0L) stop("Variables manquantes : ", paste(miss, collapse = ", "))
@@ -121,7 +133,6 @@ dt[, event2 := as.integer(event2)]
 dt[, time_day := as.numeric(time_day)]
 dt[, time_s := as.numeric(time_s)]
 dt[, scr_mgdl := as.numeric(scr_mgdl)]
-if (cfg$with_rrt == 1L) dt[, rrt_td := as.numeric(rrt_td)]
 
 cat("[DATA] rows     :", nrow(dt), "\n")
 cat("[DATA] patients :", uniqueN(dt$id), "\n")
@@ -157,7 +168,6 @@ tvar <- cfg$time_var
 
 # minimal modeling columns
 keep_cols <- c("id", tvar, "scr_w99", "tte_pos", "event2")
-if (cfg$with_rrt == 1L) keep_cols <- c(keep_cols, "rrt_td")
 dt <- dt[, ..keep_cols]
 
 setorder(dt, id, get(tvar))
@@ -172,17 +182,13 @@ dat <- as.data.frame(dt)
 # ----------------------------
 # Survival formula
 # ----------------------------
-surv_form <- if (cfg$with_rrt == 1L) {
-  Surv(tte_pos, event2) ~ rrt_td
-} else {
-  Surv(tte_pos, event2) ~ 1
-}
+surv_form <- Surv(tte_pos, event2) ~ 1
 
 # ----------------------------
 # Fit G=1 seed
 # ----------------------------
 cat("\n[SEED] Fitting G=1 quadratic | time=", tvar,
-    " | H=", cfg$horizon_d, " | with_rrt=", cfg$with_rrt, "...\n", sep="")
+    " | H=", cfg$horizon_d, "...\n", sep="")
 
 fixed_form  <- as.formula(sprintf("scr_w99 ~ %s + I(%s^2)", tvar, tvar))
 random_form <- as.formula(sprintf("~ %s", tvar))
