@@ -70,9 +70,12 @@ NROUND_MAX  <- 300
 NROUND_ESTOP <- 20
 NFOLD <- 5
 
-# Optional: recalibration MIMIC 80/20
-DO_RECAL_MIMIC <- FALSE  # Frozen external evaluation; recalibration is separate
-RECAL_PROP <- 0.80
+# Optional exploratory, class-wise logistic recalibration of the frozen M2
+# probabilities using a patient-level, stratified 10-fold cross-fitting design.
+# Raw external predictions are never overwritten.
+DO_RECAL_MIMIC <- TRUE
+RECAL_FOLDS <- 10L
+RECAL_SEED <- 20260206L
 
 msg <- function(...) cat(sprintf(...), "\n")
 
@@ -1143,132 +1146,117 @@ ggsave(file.path(OUT_DIR, "curve_frozen_brier_bis.png"), p2, width = 8, height =
 
 
 # ============================================================
-# 10) OPTIONAL: RECALIBRATION / SITE-ADAPTATION ON MIMIC (80/20)
+# 10) EXPLORATORY CLASS-WISE LOGISTIC RECALIBRATION (MIMIC-IV)
 # ============================================================
-
+#
+# Uses ONLY the frozen external M2 probabilities already stored in pred_dt.
+# The same stratified, patient-level folds are retained for all landmarks
+# and all three classes. Each held-out prediction is calibrated by a
+# logistic model fitted on the other nine folds.
+#
+# This module does not retrain XGBoost, does not change raw probabilities,
+# and does not enter the primary external-validation or enrichment metrics.
+# Independent one-versus-rest probabilities may not sum exactly to one.
+#
 if (DO_RECAL_MIMIC) {
-  msg("\n== RECALIBRATION ON MIMIC (site adaptation), 80/20 by stay_id, per day ==")
-  
-  # patient-level split on MIMIC stays (same split used for all days to be clean)
-  mim_ids <- unique(ds_M$stay_id)
-  mim_lbl <- unique(ds_M[, .(stay_id, class)])
-  setkey(mim_lbl, stay_id)
-  
-  # stratified split by class
-  split_ids_strat <- function(stay_id, y, train_prop = 0.8, seed = 1) {
-    set.seed(seed)
-    dt <- data.table(stay_id = stay_id, y = y)
-    dt <- unique(dt, by = "stay_id")
-    tr_ids <- dt[, {
-      n <- .N
-      n_tr <- max(1L, floor(n * train_prop))
-      .(stay_id = sample(stay_id, n_tr))
-    }, by = y]$stay_id
-    list(train = tr_ids, test = setdiff(dt$stay_id, tr_ids))
+  msg("\n== M2: class-wise logistic recalibration using stratified 10-fold cross-fitting ==")
+  classes_recal <- c("C1", "C2", "C3")
+  pred_m2 <- copy(as.data.table(pred_dt)[model == "M2",
+    .(id, model, day, true_class, pC1, pC2, pC3)])
+  pred_m2[, true_class := as.character(true_class)]
+  if (!nrow(pred_m2)) stop("Recalibration: no frozen M2 predictions found")
+  if (anyDuplicated(pred_m2[, .(id, day)])) {
+    stop("Recalibration: duplicated stay/day M2 predictions")
   }
-  
-  spM <- split_ids_strat(mim_lbl$stay_id, mim_lbl$class, train_prop = RECAL_PROP, seed = 20260206)
-  mim_train_ids <- spM$train
-  mim_test_ids  <- spM$test
-  
-  recal_mc <- list()
-  recal_ovr <- list()
-  
-  for (mn in names(model_raw_cols)) {
-    for (d in DAYS_TARGET) {
-      tr_d <- ds_M[stay_id %in% mim_train_ids & day_window == d]
-      te_d <- ds_M[stay_id %in% mim_test_ids  & day_window == d]
-      if (nrow(tr_d) < 50 || nrow(te_d) < 50) next
-      
-      y_tr <- as.integer(factor(tr_d$class, levels = levels_y)) - 1L
-      y_te <- as.integer(factor(te_d$class, levels = levels_y)) - 1L
-      
-      design <- build_sparse_AUMC_train__MIMIC_test(tr_d, te_d, model_raw_cols[[mn]])
-      dtr <- xgb.DMatrix(design$X_train, label = y_tr, missing = NA)
-      dte <- xgb.DMatrix(design$X_test,  label = y_te, missing = NA)
-      
-      param_mc <- c(XGB_MC, list(num_class = K))
-      cv_mc <- xgb.cv(param_mc, dtr, NROUND_MAX, NFOLD, early_stopping_rounds = NROUND_ESTOP, verbose = 0)
-      bst_mc <- xgb.train(param_mc, dtr, nrounds = cv_mc$best_iteration, verbose = 0)
-      
-      p <- predict(bst_mc, dte)
-      pmat <- matrix(p, ncol = K, byrow = TRUE)
-      pmat <- apply(pmat, 2, safe_prob); pmat <- pmat / rowSums(pmat)
-      pred_int <- max.col(pmat) - 1L
-      
-      auc_res <- multiclass_auc_ovr(y_te, pmat, K)
-      brier_mc <- brier_multiclass(y_te, pmat, K)
-      balacc <- balanced_acc(y_te, pred_int, K)
-      cal_mc <- ece_multiclass_pooled(pmat, y_te, k = 10)
-      
-      recal_mc[[paste(mn,d,sep="__")]] <- data.table(
-        model = mn, day = d,
-        n_train = nrow(tr_d), n_test = nrow(te_d),
-        balanced_acc = balacc,
-        auc_macro = auc_res$auc_macro,
-        auc_weighted = auc_res$auc_weighted,
-        brier_multiclass = brier_mc,
-        ece_pooled = cal_mc$ece,
-        best_nround = cv_mc$best_iteration
-      )
-      
-      # OvR
-      prev <- table(factor(y_tr, levels=0:(K-1)))
-      w_pos <- sapply(0:(K-1), function(k) {
-        npos <- as.numeric(prev[k+1]); nneg <- length(y_tr) - npos
-        if (npos == 0) return(1); nneg / npos
-      })
-      
-      for (k in 0:(K-1)) {
-        cls <- levels_y[k+1]
-        ytr_bin <- as.integer(y_tr == k)
-        yte_bin <- as.integer(y_te == k)
-        
-        dtrb <- xgb.DMatrix(design$X_train, label = ytr_bin, missing = NA)
-        w <- rep(1, length(ytr_bin)); w[ytr_bin==1] <- w_pos[k+1]
-        setinfo(dtrb, "weight", w)
-        
-        cv_b <- xgb.cv(XGB_BIN, dtrb, NROUND_MAX, NFOLD, early_stopping_rounds = NROUND_ESTOP, verbose = 0)
-        bst_b <- xgb.train(XGB_BIN, dtrb, nrounds = cv_b$best_iteration, verbose = 0)
-        
-        prob <- safe_prob(predict(bst_b, dte))
-        pred <- as.integer(prob > 0.5)
-        
-        roc_o <- tryCatch(pROC::roc(yte_bin, prob, quiet = TRUE), error = function(e) NULL)
-        auc <- if (is.null(roc_o)) NA_real_ else as.numeric(pROC::auc(roc_o))
-        acc <- mean(pred == yte_bin)
-        sens <- if (sum(yte_bin==1) > 0) sum(pred==1 & yte_bin==1) / sum(yte_bin==1) else NA_real_
-        spec <- if (sum(yte_bin==0) > 0) sum(pred==0 & yte_bin==0) / sum(yte_bin==0) else NA_real_
-        brier <- mean((prob - yte_bin)^2)
-        cal_b <- ece_binary(prob, yte_bin, k = 10)
-        
-        recal_ovr[[paste(mn,d,cls,sep="__")]] <- data.table(
-          model = mn, day = d, class = cls,
-          n_train = nrow(tr_d), n_test = nrow(te_d),
-          auc = auc, accuracy = acc, sensitivity = sens, specificity = spec,
-          brier = brier, ece = cal_b$ece,
-          best_nround = cv_b$best_iteration
+  if (anyNA(pred_m2$id) || anyNA(pred_m2$day) ||
+      any(!pred_m2$true_class %in% classes_recal) ||
+      any(!is.finite(as.matrix(pred_m2[, .(pC1, pC2, pC3)])))) {
+    stop("Recalibration: missing IDs, class labels or probability values")
+  }
+  if (any(abs(pred_m2$pC1 + pred_m2$pC2 + pred_m2$pC3 - 1) > 1e-5)) {
+    stop("Recalibration: invalid raw class probability sums")
+  }
+
+  # One fold allocation per patient, shared across all days and classes.
+  fold_ids <- unique(pred_m2[, .(id, true_class)])
+  if (anyDuplicated(fold_ids$id)) {
+    stop("Recalibration: inconsistent class labels across landmarks")
+  }
+  setorder(fold_ids, true_class, id)
+  set.seed(RECAL_SEED)
+  fold_ids[, fold := sample(rep(seq_len(RECAL_FOLDS), length.out = .N)),
+           by = true_class]
+  recal <- merge(pred_m2, fold_ids[, .(id, fold)],
+                 by = "id", all.x = TRUE, sort = FALSE)
+
+  eps <- 1e-6
+  clip_prob <- function(p) pmin(pmax(as.numeric(p), eps), 1 - eps)
+  for (cls in classes_recal) {
+    raw_col <- paste0("p", cls)
+    recal[, (paste0(raw_col, "_recal")) := NA_real_]
+  }
+
+  for (day_i in sort(unique(recal$day))) {
+    for (cls in classes_recal) {
+      raw_col <- paste0("p", cls)
+      out_col <- paste0(raw_col, "_recal")
+      for (fold_i in seq_len(RECAL_FOLDS)) {
+        train_i <- which(recal$day == day_i & recal$fold != fold_i)
+        test_i <- which(recal$day == day_i & recal$fold == fold_i)
+        if (!length(test_i)) next
+        y_train <- as.integer(recal$true_class[train_i] == cls)
+        if (length(unique(y_train)) != 2L) {
+          stop("Recalibration: degenerate class outcome in training fold")
+        }
+        train_data <- data.frame(
+          y = y_train,
+          logit_p = qlogis(clip_prob(recal[[raw_col]][train_i]))
         )
+        calibration_fit <- stats::glm(
+          y ~ logit_p, data = train_data,
+          family = stats::binomial()
+        )
+        test_data <- data.frame(
+          logit_p = qlogis(clip_prob(recal[[raw_col]][test_i]))
+        )
+        calibrated <- stats::predict(calibration_fit, newdata = test_data,
+                                     type = "response")
+        if (any(!is.finite(calibrated))) {
+          stop("Recalibration: non-finite predictions")
+        }
+        recal[test_i, (out_col) := as.numeric(calibrated)]
       }
-      rm(design, dtr, dte, bst_mc, cv_mc); gc()
     }
   }
-  
-  recal_mc_dt <- rbindlist(recal_mc, fill=TRUE)
-  recal_ovr_dt <- rbindlist(recal_ovr, fill=TRUE)
-  fwrite(recal_mc_dt,  file.path(OUT_DIR, "RECAL_MIMIC_multiclass_80_20_byDay.csv"))
-  fwrite(recal_ovr_dt, file.path(OUT_DIR, "RECAL_MIMIC_OvR_80_20_byDay.csv"))
-  
-  # Compare frozen vs recal (multiclass)
-  mc_dt$setting <- "Frozen AUMC->MIMIC"
-  recal_mc_dt$setting <- "Recal MIMIC 80/20"
-  cmp <- rbind(mc_dt, recal_mc_dt, fill=TRUE)
-  
-  p_cmp <- ggplot(cmp, aes(day, balanced_acc, color = setting, group = setting)) +
-    geom_line() + geom_point() + theme_bw() +
-    scale_x_continuous(breaks = DAYS_TARGET) + ylim(0,1) +
-    labs(title="Balanced accuracy over time", x="Day", y="Balanced accuracy")
-  ggsave(file.path(OUT_DIR, "compare_balanced_acc_frozen_vs_recal.png"), p_cmp, width=7, height=4, dpi=200)
+
+  recal_cols <- paste0("p", classes_recal, "_recal")
+  if (any(!is.finite(as.matrix(recal[, ..recal_cols])))) {
+    stop("Recalibration: not all held-out probabilities were predicted")
+  }
+  fwrite(recal[, .(id, model, day, true_class, fold,
+                   pC1, pC2, pC3, pC1_recal, pC2_recal, pC3_recal)],
+         file.path(OUT_DIR, "M2_classwise_logistic_recalibration_10fold.csv"))
+
+  # Class-specific, held-out Brier scores, suitable for checking Table S15.
+  brier_check <- rbindlist(lapply(sort(unique(recal$day)), function(day_i) {
+    d <- recal[day == day_i]
+    rbindlist(lapply(classes_recal, function(cls) {
+      y <- as.integer(d$true_class == cls)
+      raw_col <- paste0("p", cls)
+      rec_col <- paste0(raw_col, "_recal")
+      data.table(
+        day = day_i,
+        window_hours = (day_i + 1L) * 24L,
+        class = cls,
+        n = nrow(d),
+        brier_raw = mean((d[[raw_col]] - y)^2),
+        brier_recalibrated = mean((d[[rec_col]] - y)^2)
+      )
+    }))
+  }))
+  fwrite(brier_check,
+         file.path(OUT_DIR, "M2_recalibration_10fold_Brier_check.csv"))
+  print(brier_check[window_hours %in% c(48L, 72L)])
 }
 
 msg("\n✅ DONE. Outputs in: %s", OUT_DIR)
@@ -1548,5 +1536,6 @@ saveRDS(list(
   NFOLD = NFOLD,
   N_BOOT = N_BOOT,
   DO_RECAL_MIMIC = DO_RECAL_MIMIC,
-  RECAL_PROP = RECAL_PROP
+  RECAL_FOLDS = RECAL_FOLDS,
+  RECAL_SEED = RECAL_SEED
 ), file.path(OUT_DIR, "run_config.rds"))
