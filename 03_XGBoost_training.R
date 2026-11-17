@@ -1,5 +1,3 @@
-# Historical source pipeline, submitted by investigators. NOT YET VALIDATED as the
-# final landmark-aligned analysis; risk-set filtering must be checked.
 #!/usr/bin/env Rscript
 rm(list=ls()); gc(); graphics.off()
 
